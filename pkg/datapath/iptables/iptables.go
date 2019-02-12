@@ -18,8 +18,10 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"net"
 	"strings"
 
+	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/command/exec"
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/defaults"
@@ -33,13 +35,16 @@ import (
 
 const (
 	ciliumOutputChain     = "CILIUM_OUTPUT"
+	ciliumOutputRawChain  = "CILIUM_OUTPUT_raw"
 	ciliumPostNatChain    = "CILIUM_POST"
 	ciliumPostMangleChain = "CILIUM_POST_mangle"
 	ciliumPreMangleChain  = "CILIUM_PRE_mangle"
+	ciliumPreRawChain     = "CILIUM_PRE_raw"
 	ciliumForwardChain    = "CILIUM_FORWARD"
 	feederDescription     = "cilium-feeder:"
 )
 
+var useIp4tables bool
 var useIp6tables bool
 
 type customChain struct {
@@ -68,16 +73,14 @@ func getFeedRule(name, args string) []string {
 }
 
 func (c *customChain) add() error {
-	err := runProg("iptables", []string{"-t", c.table, "-N", c.name}, false)
-	if err == nil && c.ipv6 == true {
+	var err error
+	if node.GetIPv4AllocRange() != nil {
+		err = runProg("iptables", []string{"-t", c.table, "-N", c.name}, false)
+		useIp4tables = (err == nil)
+	}
+	if err == nil && c.ipv6 == true && node.GetIPv6AllocRange() != nil {
 		err = runProg("ip6tables", []string{"-t", c.table, "-N", c.name}, false)
-		if err == nil {
-			useIp6tables = true
-		} else {
-			useIp6tables = false
-			log.WithError(err).Info("No ip6tables support, IPv6 redirects will not work.")
-			// err = nil
-		}
+		useIp6tables = (err == nil)
 	}
 	return err
 }
@@ -160,7 +163,10 @@ func (c *customChain) installFeeder() error {
 	}
 
 	for _, feedArgs := range c.feederArgs {
-		err := runProg("iptables", append([]string{"-t", c.table, installMode, c.hook}, getFeedRule(c.name, feedArgs)...), true)
+		var err error
+		if useIp4tables {
+			err = runProg("iptables", append([]string{"-t", c.table, installMode, c.hook}, getFeedRule(c.name, feedArgs)...), true)
+		}
 		if err == nil && useIp6tables && c.ipv6 == true {
 			err = runProg("ip6tables", append([]string{"-t", c.table, installMode, c.hook}, getFeedRule(c.name, feedArgs)...), true)
 		}
@@ -186,6 +192,13 @@ var ciliumChains = []customChain{
 		feederArgs: []string{""},
 	},
 	{
+		name:       ciliumOutputRawChain,
+		table:      "raw",
+		hook:       "OUTPUT",
+		feederArgs: []string{""},
+		ipv6:       true,
+	},
+	{
 		name:       ciliumPostNatChain,
 		table:      "nat",
 		hook:       "POSTROUTING",
@@ -205,6 +218,13 @@ var ciliumChains = []customChain{
 		ipv6:       true,
 	},
 	{
+		name:       ciliumPreRawChain,
+		table:      "raw",
+		hook:       "PREROUTING",
+		feederArgs: []string{""},
+		ipv6:       true,
+	},
+	{
 		name:       ciliumForwardChain,
 		table:      "filter",
 		hook:       "FORWARD",
@@ -214,9 +234,14 @@ var ciliumChains = []customChain{
 
 // RemoveRules removes iptables rules installed by Cilium.
 func RemoveRules() {
+	// Set of tables that has had iptables rules in any Cilium version
 	tables := []string{"nat", "mangle", "raw", "filter"}
 	for _, t := range tables {
 		removeCiliumRules(t, "iptables")
+	}
+	// Set of tables that has had ip6tables rules in any Cilium version
+	tables6 := []string{"mangle", "raw"}
+	for _, t := range tables6 {
 		removeCiliumRules(t, "ip6tables")
 	}
 
@@ -230,20 +255,23 @@ func installIngressProxyRule(l4proto string, proxyPort uint16) error {
 	dscp := proxyPort & 0x3F
 	ingressDSCPMatch := fmt.Sprintf("%d", dscp)
 	// TPROXY params
-	ingressProxyMark := fmt.Sprintf("%#08x/%#08x", proxy.MagicMarkIsToProxy, proxy.MagicMarkHostMask)
+	ingressProxyMark := fmt.Sprintf("%#08x", proxy.MagicMarkIsToProxy)
 	ingressProxyPort := fmt.Sprintf("%d", proxyPort)
 
-	err := runProg("iptables", []string{
-		"-t", "mangle",
-		"-A", ciliumPreMangleChain,
-		"-i", defaults.HostDevice,
-		"-d", node.GetIPv4AllocRange().String(),
-		"-p", l4proto,
-		"-m", "dscp", "--dscp", ingressDSCPMatch,
-		"-m", "comment", "--comment", "cilium: TPROXY to host ingress proxy on " + defaults.HostDevice,
-		"-j", "TPROXY",
-		"--tproxy-mark", ingressProxyMark,
-		"--on-port", ingressProxyPort}, false)
+	var err error
+	if useIp4tables {
+		err = runProg("iptables", []string{
+			"-t", "mangle",
+			"-A", ciliumPreMangleChain,
+			"-i", defaults.HostDevice,
+			"-d", node.GetIPv4AllocRange().String(),
+			"-p", l4proto,
+			"-m", "dscp", "--dscp", ingressDSCPMatch,
+			"-m", "comment", "--comment", "cilium: TPROXY to host ingress proxy on " + defaults.HostDevice,
+			"-j", "TPROXY",
+			"--tproxy-mark", ingressProxyMark,
+			"--on-port", ingressProxyPort}, false)
+	}
 	if err == nil && useIp6tables {
 		err = runProg("ip6tables", []string{
 			"-t", "mangle",
@@ -263,20 +291,23 @@ func installIngressProxyRule(l4proto string, proxyPort uint16) error {
 func installEgressProxyRule(l4proto string, proxyPort uint16) error {
 	// Match
 	dscp := int(proxyPort & 0x3F)
-	egressMarkMatch := fmt.Sprintf("%#08x/%#08x", proxy.MagicMarkIsToProxy|dscp, proxy.MagicMarkHostMask|0xFF)
+	egressMarkMatch := fmt.Sprintf("%#08x", proxy.MagicMarkIsToProxy|dscp)
 	// TPROXY params
-	egressProxyMark := fmt.Sprintf("%#08x/%#08x", proxy.MagicMarkIsToProxy, proxy.MagicMarkHostMask|0xFF)
+	egressProxyMark := fmt.Sprintf("%#08x", proxy.MagicMarkIsToProxy)
 	egressProxyPort := fmt.Sprintf("%d", proxyPort)
-	err := runProg("iptables", []string{
-		"-t", "mangle",
-		"-A", ciliumPreMangleChain,
-		"-i", "lxc+",
-		"-p", l4proto,
-		"-m", "mark", "--mark", egressMarkMatch,
-		"-m", "comment", "--comment", "cilium: TPROXY to host egress proxy on lxc+",
-		"-j", "TPROXY",
-		"--tproxy-mark", egressProxyMark,
-		"--on-port", egressProxyPort}, false)
+	var err error
+	if useIp4tables {
+		err = runProg("iptables", []string{
+			"-t", "mangle",
+			"-A", ciliumPreMangleChain,
+			"-i", "lxc+",
+			"-p", l4proto,
+			"-m", "mark", "--mark", egressMarkMatch,
+			"-m", "comment", "--comment", "cilium: TPROXY to host egress proxy on lxc+",
+			"-j", "TPROXY",
+			"--tproxy-mark", egressProxyMark,
+			"--on-port", egressProxyPort}, false)
+	}
 	if err == nil && useIp6tables {
 		err = runProg("ip6tables", []string{
 			"-t", "mangle",
@@ -292,7 +323,95 @@ func installEgressProxyRule(l4proto string, proxyPort uint16) error {
 	return err
 }
 
+func iptRange(cidr *cidr.CIDR) string {
+	start := cidr.IP.Mask(cidr.Mask)
+	end := net.IP(make([]byte, len(cidr.IP)))
+	for i := range cidr.IP {
+		end[i] = cidr.IP[i] | ^cidr.Mask[i]
+	}
+	return start.String() + "-" + end.String()
+}
+
+// -A PREROUTING ! -d 10.15.0.1/32 -i cilium_host -m iprange --dst-range 10.15.0.0-10.15.255.255 -m dscp ! --dscp 0x00 -j NOTRACK
+func installProxyNotrackRules() error {
+	// match traffic to proxy
+	toProxyMarkMatch := fmt.Sprintf("%#08x/%#08x", proxy.MagicMarkIsToProxy, proxy.MagicMarkHostMask)
+	// match return traffic from proxy (identity is all zeroes).
+	// Mask ignores the one bit that marks whether the progxy is ingress or egress
+	matchProxyReply := fmt.Sprintf("%#08x/%#08x", proxy.MagicMarkIsProxy, ^uint32(proxy.MagicMarkHostMask&^proxy.MagicMarkProxyMask))
+	var err error
+	if useIp4tables {
+		// No conntrack for traffic to ingress proxy
+		err = runProg("iptables", []string{
+			"-t", "raw",
+			"-A", ciliumPreRawChain,
+			"-i", defaults.HostDevice,
+			"!", "-d", node.GetInternalIPv4().String(),
+			"-m", "iprange", "--dst-range", iptRange(node.GetIPv4AllocRange()),
+			"-m", "dscp", "!", "--dscp", "0x00",
+			"-m", "comment", "--comment", "cilium: NOTRACK for ingress proxy traffic on " + defaults.HostDevice,
+			"-j", "NOTRACK"}, false)
+		if err == nil {
+			// No conntrack for traffic to egress proxy
+			err = runProg("iptables", []string{
+				"-t", "raw",
+				"-A", ciliumPreRawChain,
+				"-i", "lxc+",
+				"-m", "mark", "--mark", toProxyMarkMatch,
+				"-m", "comment", "--comment", "cilium: NOTRACK for egress proxy traffic on lxc+",
+				"-j", "NOTRACK"}, false)
+		}
+		if err == nil {
+			// No conntrack for proxy return traffic
+			err = runProg("iptables", []string{
+				"-t", "raw",
+				"-A", ciliumOutputRawChain,
+				"-d", node.GetIPv4AllocRange().String(),
+				"-m", "mark", "--mark", matchProxyReply,
+				"-m", "comment", "--comment", "cilium: NOTRACK for proxy return traffic",
+				"-j", "NOTRACK"}, false)
+		}
+	}
+	if err == nil && useIp6tables {
+		// No conntrack for traffic to ingress proxy
+		err = runProg("ip6tables", []string{
+			"-t", "raw",
+			"-A", ciliumPreRawChain,
+			"-i", defaults.HostDevice,
+			"!", "-d", node.GetIPv6().String(),
+			"-m", "iprange", "--dst-range", iptRange(node.GetIPv6AllocRange()),
+			"-m", "dscp", "!", "--dscp", "0x00",
+			"-m", "comment", "--comment", "cilium: NOTRACK for ingress proxy traffic on " + defaults.HostDevice,
+			"-j", "NOTRACK"}, false)
+		if err == nil {
+			// No conntrack for traffic to egress proxy
+			err = runProg("ip6tables", []string{
+				"-t", "raw",
+				"-A", ciliumPreRawChain,
+				"-i", "lxc+",
+				"-m", "mark", "--mark", toProxyMarkMatch,
+				"-m", "comment", "--comment", "cilium: NOTRACK for egress proxy traffic on lxc+",
+				"-j", "NOTRACK"}, false)
+		}
+		if err == nil {
+			// No conntrack for proxy return traffic
+			err = runProg("ip6tables", []string{
+				"-t", "raw",
+				"-A", ciliumOutputRawChain,
+				"-d", node.GetIPv6AllocRange().String(),
+				"-m", "mark", "--mark", matchProxyReply,
+				"-m", "comment", "--comment", "cilium: NOTRACK for proxy return traffic",
+				"-j", "NOTRACK"}, false)
+		}
+	}
+	return err
+}
+
 func installProxyRules() error {
+	if err := installProxyNotrackRules(); err != nil {
+		return err
+	}
+
 	for _, v := range proxy.ProxyPorts {
 		// Redirect packets to the host proxy via TPROXY, as directed by the Cilium
 		// datapath bpf programs via skb marks (egress) or DSCP (ingress).
@@ -328,174 +447,175 @@ func InstallRules(ifName string) error {
 		return fmt.Errorf("cannot add proxy rules: %s", err)
 	}
 
-	matchFromIPSecEncrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkDecrypt, linux_defaults.RouteMarkMask)
-	matchFromIPSecDecrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkEncrypt, linux_defaults.RouteMarkMask)
+	if useIp4tables {
+		matchFromIPSecEncrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkDecrypt, linux_defaults.RouteMarkMask)
+		matchFromIPSecDecrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkEncrypt, linux_defaults.RouteMarkMask)
 
-	// Clear the Kubernetes masquerading mark bit to skip source PAT
-	// performed by kube-proxy for all packets destined for Cilium. Cilium
-	// installs a dedicated rule which does the source PAT to the right
-	// source IP.
-	clearMasqBit := fmt.Sprintf("%#08x/%#08x", 0, proxy.MagicMarkK8sMasq)
-	if err := runProg("iptables", []string{
-		"-t", "mangle",
-		"-A", ciliumPostMangleChain,
-		"-o", ifName,
-		"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
-		"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
-		"-m", "comment", "--comment", "cilium: clear masq bit for pkts to " + ifName,
-		"-j", "MARK", "--set-xmark", clearMasqBit}, false); err != nil {
-		return err
-	}
-
-	// kube-proxy does not change the default policy of the FORWARD chain
-	// which means that while packets to services are properly DNAT'ed,
-	// they are later dropped in the FORWARD chain. The issue has been
-	// resolved in #52569 and will be fixed in k8s >= 1.8. The following is
-	// a workaround for earlier Kubernetes versions.
-	//
-	// Accept all packets in FORWARD chain that are going to ifName.
-	// It is safe to ignore the destination IP here as the pre-requisite
-	// for a packet being routed to ifName is that a route exists
-	// which is only installed for known node IP CIDR ranges.
-	if err := runProg("iptables", []string{
-		"-A", ciliumForwardChain,
-		"-o", ifName,
-		"-m", "comment", "--comment", "cilium: any->cluster on " + ifName + " forward accept",
-		"-j", "ACCEPT"}, false); err != nil {
-		return err
-	}
-
-	// Accept all packets in the FORWARD chain that are coming from the
-	// ifName interface with a source IP in the local node
-	// allocation range.
-	if err := runProg("iptables", []string{
-		"-A", ciliumForwardChain,
-		"-s", node.GetIPv4AllocRange().String(),
-		"-m", "comment", "--comment", "cilium: cluster->any forward accept",
-		"-j", "ACCEPT"}, false); err != nil {
-		return err
-	}
-
-	// Mark all packets sourced from processes running on the host with a
-	// special marker so that we can differentiate traffic sourced locally
-	// vs. traffic from the outside world that was masqueraded to appear
-	// like it's from the host.
-	//
-	// Originally we set this mark only for traffic destined to the
-	// ifName device, to ensure that any traffic directly reaching
-	// to a Cilium-managed IP could be classified as from the host.
-	//
-	// However, there's another case where a local process attempts to
-	// reach a service IP which is backed by a Cilium-managed pod. The
-	// service implementation is outside of Cilium's control, for example,
-	// handled by kube-proxy. We can tag even this traffic with a magic
-	// mark, then when the service implementation proxies it back into
-	// Cilium the BPF will see this mark and understand that the packet
-	// originated from the host.
-	matchFromProxy := fmt.Sprintf("%#08x/%#08x", proxy.MagicMarkIsProxy, proxy.MagicMarkProxyMask)
-	markAsFromHost := fmt.Sprintf("%#08x/%#08x", proxy.MagicMarkHost, proxy.MagicMarkHostMask)
-	if err := runProg("iptables", []string{
-		"-t", "filter",
-		"-A", ciliumOutputChain,
-		"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
-		"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
-		"-m", "mark", "!", "--mark", matchFromProxy, // Don't match proxy traffic
-		"-m", "comment", "--comment", "cilium: host->any mark as from host",
-		"-j", "MARK", "--set-xmark", markAsFromHost}, false); err != nil {
-		return err
-	}
-
-	if option.Config.Masquerade {
-		ingressSnatSrcAddrExclusion := node.GetHostMasqueradeIPv4().String()
-		if option.Config.Tunnel == option.TunnelDisabled {
-			ingressSnatSrcAddrExclusion = node.GetIPv4ClusterRange().String()
-		}
-
-		// Masquerade all traffic from the host into the ifName
-		// interface if the source is not the internal IP
-		//
-		// The following conditions must be met:
-		// * Must be targeted for the ifName interface
-		// * Must be targeted to an IP that is not local
-		// * Tunnel mode:
-		//   * May not already be originating from the masquerade IP
-		// * Non-tunnel mode:
-		//   * May not orignate from any IP inside of the cluster range
+		// Clear the Kubernetes masquerading mark bit to skip source PAT
+		// performed by kube-proxy for all packets destined for Cilium. Cilium
+		// installs a dedicated rule which does the source PAT to the right
+		// source IP.
+		clearMasqBit := fmt.Sprintf("%#08x/%#08x", 0, proxy.MagicMarkK8sMasq)
 		if err := runProg("iptables", []string{
-			"-t", "nat",
-			"-A", ciliumPostNatChain,
-			"!", "-s", ingressSnatSrcAddrExclusion,
-			"!", "-d", node.GetIPv4AllocRange().String(),
+			"-t", "mangle",
+			"-A", ciliumPostMangleChain,
+			"-o", ifName,
 			"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
 			"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
-			"-o", ifName,
-			"-m", "comment", "--comment", "cilium host->cluster masquerade",
-			"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
+			"-m", "comment", "--comment", "cilium: clear masq bit for pkts to " + ifName,
+			"-j", "MARK", "--set-xmark", clearMasqBit}, false); err != nil {
 			return err
 		}
 
-		// Masquerade all traffic from the host into the ifName
-		// interface if the source is 127.0.0.1
+		// kube-proxy does not change the default policy of the FORWARD chain
+		// which means that while packets to services are properly DNAT'ed,
+		// they are later dropped in the FORWARD chain. The issue has been
+		// resolved in #52569 and will be fixed in k8s >= 1.8. The following is
+		// a workaround for earlier Kubernetes versions.
 		//
-		// The following conditions must be met:
-		// * Must be targeted for the ifName interface
-		// * Must be from 127.0.0.1
+		// Accept all packets in FORWARD chain that are going to ifName.
+		// It is safe to ignore the destination IP here as the pre-requisite
+		// for a packet being routed to ifName is that a route exists
+		// which is only installed for known node IP CIDR ranges.
 		if err := runProg("iptables", []string{
-			"-t", "nat",
-			"-A", ciliumPostNatChain,
-			"-s", "127.0.0.1",
-			"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
-			"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
+			"-A", ciliumForwardChain,
 			"-o", ifName,
-			"-m", "comment", "--comment", "cilium host->cluster from 127.0.0.1 masquerade",
-			"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
+			"-m", "comment", "--comment", "cilium: any->cluster on " + ifName + " forward accept",
+			"-j", "ACCEPT"}, false); err != nil {
 			return err
 		}
 
-		// Masquerade all traffic from a local endpoint that is routed
-		// back to an endpoint on the same node. This happens if a
-		// local endpoint talks to a Kubernetes NodePort or HostPort.
+		// Accept all packets in the FORWARD chain that are coming from the
+		// ifName interface with a source IP in the local node
+		// allocation range.
 		if err := runProg("iptables", []string{
-			"-t", "nat",
-			"-A", ciliumPostNatChain,
+			"-A", ciliumForwardChain,
 			"-s", node.GetIPv4AllocRange().String(),
+			"-m", "comment", "--comment", "cilium: cluster->any forward accept",
+			"-j", "ACCEPT"}, false); err != nil {
+			return err
+		}
+
+		// Mark all packets sourced from processes running on the host with a
+		// special marker so that we can differentiate traffic sourced locally
+		// vs. traffic from the outside world that was masqueraded to appear
+		// like it's from the host.
+		//
+		// Originally we set this mark only for traffic destined to the
+		// ifName device, to ensure that any traffic directly reaching
+		// to a Cilium-managed IP could be classified as from the host.
+		//
+		// However, there's another case where a local process attempts to
+		// reach a service IP which is backed by a Cilium-managed pod. The
+		// service implementation is outside of Cilium's control, for example,
+		// handled by kube-proxy. We can tag even this traffic with a magic
+		// mark, then when the service implementation proxies it back into
+		// Cilium the BPF will see this mark and understand that the packet
+		// originated from the host.
+		matchFromProxy := fmt.Sprintf("%#08x/%#08x", proxy.MagicMarkIsProxy, proxy.MagicMarkProxyMask)
+		markAsFromHost := fmt.Sprintf("%#08x/%#08x", proxy.MagicMarkHost, proxy.MagicMarkHostMask)
+		if err := runProg("iptables", []string{
+			"-t", "filter",
+			"-A", ciliumOutputChain,
 			"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
 			"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
 			"-m", "mark", "!", "--mark", matchFromProxy, // Don't match proxy traffic
-			"-o", ifName,
-			"-m", "comment", "--comment", "cilium hostport loopback masquerade",
-			"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
+			"-m", "comment", "--comment", "cilium: host->any mark as from host",
+			"-j", "MARK", "--set-xmark", markAsFromHost}, false); err != nil {
 			return err
 		}
 
-		egressSnatDstAddrExclusion := node.GetIPv4AllocRange().String()
-		if option.Config.Tunnel == option.TunnelDisabled {
-			egressSnatDstAddrExclusion = node.GetIPv4ClusterRange().String()
-		}
+		if option.Config.Masquerade {
+			ingressSnatSrcAddrExclusion := node.GetHostMasqueradeIPv4().String()
+			if option.Config.Tunnel == option.TunnelDisabled {
+				ingressSnatSrcAddrExclusion = node.GetIPv4ClusterRange().String()
+			}
 
-		// Masquerade all egress traffic leaving the node
-		//
-		// The following conditions must be met:
-		// * May not leave on a cilium_ interface, this excludes all
-		//   tunnel traffic
-		// * Must originate from an IP in the local allocation range
-		// * Tunnel mode:
-		//   * May not be targeted to an IP in the local allocation
-		//     range
-		// * Non-tunnel mode:
-		//   * May not be targeted to an IP in the cluster range
-		if err := runProg("iptables", []string{
-			"-t", "nat",
-			"-A", "CILIUM_POST",
-			"-s", node.GetIPv4AllocRange().String(),
-			"!", "-d", egressSnatDstAddrExclusion,
-			"!", "-o", "cilium_+",
-			"-m", "comment", "--comment", "cilium masquerade non-cluster",
-			"-j", "MASQUERADE"}, false); err != nil {
-			return err
+			// Masquerade all traffic from the host into the ifName
+			// interface if the source is not the internal IP
+			//
+			// The following conditions must be met:
+			// * Must be targeted for the ifName interface
+			// * Must be targeted to an IP that is not local
+			// * Tunnel mode:
+			//   * May not already be originating from the masquerade IP
+			// * Non-tunnel mode:
+			//   * May not orignate from any IP inside of the cluster range
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"!", "-s", ingressSnatSrcAddrExclusion,
+				"!", "-d", node.GetIPv4AllocRange().String(),
+				"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
+				"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
+				"-o", ifName,
+				"-m", "comment", "--comment", "cilium host->cluster masquerade",
+				"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
+				return err
+			}
+
+			// Masquerade all traffic from the host into the ifName
+			// interface if the source is 127.0.0.1
+			//
+			// The following conditions must be met:
+			// * Must be targeted for the ifName interface
+			// * Must be from 127.0.0.1
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"-s", "127.0.0.1",
+				"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
+				"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
+				"-o", ifName,
+				"-m", "comment", "--comment", "cilium host->cluster from 127.0.0.1 masquerade",
+				"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
+				return err
+			}
+
+			// Masquerade all traffic from a local endpoint that is routed
+			// back to an endpoint on the same node. This happens if a
+			// local endpoint talks to a Kubernetes NodePort or HostPort.
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"-s", node.GetIPv4AllocRange().String(),
+				"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
+				"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
+				"-m", "mark", "!", "--mark", matchFromProxy, // Don't match proxy (return) traffic
+				"-o", ifName,
+				"-m", "comment", "--comment", "cilium hostport loopback masquerade",
+				"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
+				return err
+			}
+
+			egressSnatDstAddrExclusion := node.GetIPv4AllocRange().String()
+			if option.Config.Tunnel == option.TunnelDisabled {
+				egressSnatDstAddrExclusion = node.GetIPv4ClusterRange().String()
+			}
+
+			// Masquerade all egress traffic leaving the node
+			//
+			// The following conditions must be met:
+			// * May not leave on a cilium_ interface, this excludes all
+			//   tunnel traffic
+			// * Must originate from an IP in the local allocation range
+			// * Tunnel mode:
+			//   * May not be targeted to an IP in the local allocation
+			//     range
+			// * Non-tunnel mode:
+			//   * May not be targeted to an IP in the cluster range
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", "CILIUM_POST",
+				"-s", node.GetIPv4AllocRange().String(),
+				"!", "-d", egressSnatDstAddrExclusion,
+				"!", "-o", "cilium_+",
+				"-m", "comment", "--comment", "cilium masquerade non-cluster",
+				"-j", "MASQUERADE"}, false); err != nil {
+				return err
+			}
 		}
 	}
-
 	for _, c := range ciliumChains {
 		if err := c.installFeeder(); err != nil {
 			return fmt.Errorf("cannot install feeder rule %s: %s", c.feederArgs, err)
