@@ -366,7 +366,9 @@ func installProxyNotrackRules() error {
 			err = runProg("iptables", []string{
 				"-t", "raw",
 				"-A", ciliumOutputRawChain,
-				"-d", node.GetIPv4AllocRange().String(),
+				// Return traffic is from a local node POD address
+				"!", "-s", node.GetInternalIPv4().String(),
+				"-m", "iprange", "--src-range", iptRange(node.GetIPv4AllocRange()),
 				"-m", "mark", "--mark", matchProxyReply,
 				"-m", "comment", "--comment", "cilium: NOTRACK for proxy return traffic",
 				"-j", "NOTRACK"}, false)
@@ -398,7 +400,9 @@ func installProxyNotrackRules() error {
 			err = runProg("ip6tables", []string{
 				"-t", "raw",
 				"-A", ciliumOutputRawChain,
-				"-d", node.GetIPv6AllocRange().String(),
+				// Return traffic is from a local node POD address
+				"!", "-s", node.GetIPv6().String(),
+				"-m", "iprange", "--src-range", iptRange(node.GetIPv6AllocRange()),
 				"-m", "mark", "--mark", matchProxyReply,
 				"-m", "comment", "--comment", "cilium: NOTRACK for proxy return traffic",
 				"-j", "NOTRACK"}, false)
