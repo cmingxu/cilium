@@ -357,6 +357,8 @@ func installProxyNotrackRules() error {
 				"-t", "raw",
 				"-A", ciliumPreRawChain,
 				"-i", "lxc+",
+				"!", "-d", node.GetInternalIPv4().String(),
+				"-m", "iprange", "--dst-range", iptRange(node.GetIPv4AllocRange()),
 				"-m", "mark", "--mark", toProxyMarkMatch,
 				"-m", "comment", "--comment", "cilium: NOTRACK for egress proxy traffic on lxc+",
 				"-j", "NOTRACK"}, false)
@@ -535,63 +537,6 @@ func InstallRules(ifName string) error {
 				ingressSnatSrcAddrExclusion = node.GetIPv4ClusterRange().String()
 			}
 
-			// Masquerade all traffic from the host into the ifName
-			// interface if the source is not the internal IP
-			//
-			// The following conditions must be met:
-			// * Must be targeted for the ifName interface
-			// * Must be targeted to an IP that is not local
-			// * Tunnel mode:
-			//   * May not already be originating from the masquerade IP
-			// * Non-tunnel mode:
-			//   * May not orignate from any IP inside of the cluster range
-			if err := runProg("iptables", []string{
-				"-t", "nat",
-				"-A", ciliumPostNatChain,
-				"!", "-s", ingressSnatSrcAddrExclusion,
-				"!", "-d", node.GetIPv4AllocRange().String(),
-				"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
-				"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
-				"-o", ifName,
-				"-m", "comment", "--comment", "cilium host->cluster masquerade",
-				"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
-				return err
-			}
-
-			// Masquerade all traffic from the host into the ifName
-			// interface if the source is 127.0.0.1
-			//
-			// The following conditions must be met:
-			// * Must be targeted for the ifName interface
-			// * Must be from 127.0.0.1
-			if err := runProg("iptables", []string{
-				"-t", "nat",
-				"-A", ciliumPostNatChain,
-				"-s", "127.0.0.1",
-				"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
-				"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
-				"-o", ifName,
-				"-m", "comment", "--comment", "cilium host->cluster from 127.0.0.1 masquerade",
-				"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
-				return err
-			}
-
-			// Masquerade all traffic from a local endpoint that is routed
-			// back to an endpoint on the same node. This happens if a
-			// local endpoint talks to a Kubernetes NodePort or HostPort.
-			if err := runProg("iptables", []string{
-				"-t", "nat",
-				"-A", ciliumPostNatChain,
-				"-s", node.GetIPv4AllocRange().String(),
-				"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
-				"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
-				"-m", "mark", "!", "--mark", matchFromProxy, // Don't match proxy (return) traffic
-				"-o", ifName,
-				"-m", "comment", "--comment", "cilium hostport loopback masquerade",
-				"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
-				return err
-			}
-
 			egressSnatDstAddrExclusion := node.GetIPv4AllocRange().String()
 			if option.Config.Tunnel == option.TunnelDisabled {
 				egressSnatDstAddrExclusion = node.GetIPv4ClusterRange().String()
@@ -610,12 +555,119 @@ func InstallRules(ifName string) error {
 			//   * May not be targeted to an IP in the cluster range
 			if err := runProg("iptables", []string{
 				"-t", "nat",
-				"-A", "CILIUM_POST",
+				"-A", ciliumPostNatChain,
 				"-s", node.GetIPv4AllocRange().String(),
 				"!", "-d", egressSnatDstAddrExclusion,
 				"!", "-o", "cilium_+",
 				"-m", "comment", "--comment", "cilium masquerade non-cluster",
 				"-j", "MASQUERADE"}, false); err != nil {
+				return err
+			}
+
+			// Exclude traffic for other than ifName interface from the masquarade rules
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"!", "-o", ifName,
+				"-m", "comment", "--comment", "exclude non-" + ifName + " traffic from masquerade",
+				"-j", "RETURN"}, false); err != nil {
+				return err
+			}
+			// Exclude crypto traffic from the masquarade rules
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"-m", "mark", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
+				"-m", "comment", "--comment", "exclude encrypt from masquerade",
+				"-j", "RETURN"}, false); err != nil {
+				return err
+			}
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"-m", "mark", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
+				"-m", "comment", "--comment", "exclude decrypt from masquerade",
+				"-j", "RETURN"}, false); err != nil {
+				return err
+			}
+			// Exclude proxy return traffic from the masquarade rules
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"-m", "mark", "--mark", matchFromProxy, // Don't match proxy (return) traffic
+				"-m", "comment", "--comment", "exclude proxy return traffic from masquarade",
+				"-j", "RETURN"}, false); err != nil {
+				return err
+			}
+
+			// Masquerade all traffic from the host into Cilium cluster
+			// if the source is not the internal IP
+			//
+			// The following conditions must be met:
+			// * Must be targeted to an IP that is not local
+			// * Tunnel mode:
+			//   * May not already be originating from the masquerade IP
+			// * Non-tunnel mode:
+			//   * May not originate from any IP inside of the cluster range
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"!", "-s", ingressSnatSrcAddrExclusion,
+				"!", "-d", node.GetIPv4AllocRange().String(),
+				"-m", "comment", "--comment", "cilium host->cluster masquerade",
+				"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
+				return err
+			}
+
+			// Masquerade all traffic from the host into Cilium
+			// if the source is 127.0.0.1
+			//
+			// The following conditions must be met:
+			// * Must be from 127.0.0.1
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"-s", "127.0.0.1",
+				"-m", "comment", "--comment", "cilium host->cluster from 127.0.0.1 masquerade",
+				"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
+				return err
+			}
+
+			// Masquerade all traffic from a local endpoint that is routed
+			// back to an endpoint on the same node. This happens if a
+			// local endpoint talks to a Kubernetes NodePort or HostPort.
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"-s", node.GetIPv4AllocRange().String(),
+				"-m", "comment", "--comment", "cilium hostport loopback masquerade",
+				"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
+				return err
+			}
+
+			// Masquerade all traffic from the host into the
+			// local Cilium cluster range if the source is not
+			// in the cluster range and DNAT has been
+			// applied.  These conditions are met by traffic
+			// redirected via hostports from non-cluster sources.
+			// The SNAT to the cluster address is needed so that
+			// the return traffic from a host proxy (when used) is
+			// routed back via the cilium_host device also
+			// when the source address is originally
+			// outside of the cluster range.
+			//
+			// The following conditions must be met:
+			// * Must be targeted to an IP that IS local
+			// * May not originate from any IP inside of the cluster range
+			// * Must have DNAT applied (k8s hostport, etc.)
+			if err := runProg("iptables", []string{
+				"-t", "nat",
+				"-A", ciliumPostNatChain,
+				"!", "-s", node.GetIPv4ClusterRange().String(),
+				"-d", node.GetIPv4AllocRange().String(),
+				"-m", "conntrack", "--ctstate", "DNAT",
+				"-m", "comment", "--comment", "cilium hostport cluster masquerade",
+				"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
 				return err
 			}
 		}
